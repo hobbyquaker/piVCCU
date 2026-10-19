@@ -1,17 +1,26 @@
-obj-m += eq3_char_loop.o
-obj-m += plat_eq3ccu2.o
+#obj-m += eq3_char_loop.o
+#obj-m += plat_eq3ccu2.o
 obj-m += generic_raw_uart.o
+ifeq ($(CONFIG_ARCH_BCM2835),y)
 obj-m += pl011_raw_uart.o
+endif
+ifeq ($(CONFIG_ARCH_ROCKCHIP),y)
 obj-m += dw_apb_raw_uart.o
+endif
+ifeq ($(CONFIG_ARCH_MESON),y)
 obj-m += meson_raw_uart.o
-obj-m += fake_hmrf.o
+endif
+#obj-m += fake_hmrf.o
 obj-m += rpi_rf_mod_led.o
 obj-m += dummy_rx8130.o
-obj-m += led_trigger_timer.o
+#obj-m += led_trigger_timer.o
 obj-m += hb_rf_usb.o
 obj-m += hb_rf_usb_2.o
 obj-m += hb_rf_eth.o
-obj-m += rtc-rx8130.o
+#obj-m += rtc-rx8130.o
+
+# disable
+ifeq (0,1)
 
 ifeq ($(KERNELRELEASE),)
   KERNELRELEASE := $(shell uname -r)
@@ -32,3 +41,4 @@ all:
 clean:
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
 
+endif
