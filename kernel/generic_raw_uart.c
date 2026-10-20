@@ -1091,6 +1091,23 @@ static inline bool i2c_client_has_driver(struct i2c_client *client)
 }
 #endif
 
+#if defined(CONFIG_OF) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0))
+/*
+ * The RTC device is not there yet: the probe is deferred and retried by the driver core, which is
+ * not an error. dev_err_probe() logs -EPROBE_DEFER at debug level only and records the reason in
+ * /sys/kernel/debug/devices_deferred.
+ */
+static int generic_raw_uart_defer_probe(struct device *dev, const char *reason)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0))
+  return dev_err_probe(dev, -EPROBE_DEFER, "%s\n", reason);
+#else
+  dev_dbg(dev, "%s", reason);
+  return -EPROBE_DEFER;
+#endif
+}
+#endif
+
 static int generic_raw_uart_probe_rtc_device(struct device *dev, bool *rtc_detected)
 {
   int err = 0;
@@ -1118,8 +1135,7 @@ static int generic_raw_uart_probe_rtc_device(struct device *dev, bool *rtc_detec
 
         if (!rtc_client)
         {
-          dev_err(dev, "Configured RTC device is not yet initialized");
-          err = -EPROBE_DEFER;
+          err = generic_raw_uart_defer_probe(dev, "Configured RTC device is not yet initialized");
         }
         else
         {
@@ -1153,8 +1169,7 @@ static int generic_raw_uart_probe_rtc_device(struct device *dev, bool *rtc_detec
       }
       else
       {
-        dev_err(dev, "I2C adapter of configured RTC device is not yet initialized");
-        err = -EPROBE_DEFER;
+        err = generic_raw_uart_defer_probe(dev, "I2C adapter of configured RTC device is not yet initialized");
       }
 
       of_node_put(rtc_of_node);
