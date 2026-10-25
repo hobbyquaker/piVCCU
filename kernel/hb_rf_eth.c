@@ -63,6 +63,15 @@ static struct device *dev = NULL;
 
 static char currentEndpointIdentifier = 0;
 
+/* number of failed attempts to resume the previous session before also
+   trying to start a new one */
+#define NEW_SESSION_INTERVAL 10
+
+/* radio frame forwarding was enabled for the open raw-uart connection */
+static bool connection_started = false;
+/* the open raw-uart connection predates the current gateway session */
+static bool session_lost = false;
+
 struct send_msg_queue_entry {
   char buffer[BUFFER_SIZE];
   size_t len;
@@ -295,6 +304,17 @@ static int hb_rf_eth_try_connect(char endpointIdentifier)
   _sock = sock;
   sysfs_notify(&dev->kobj, NULL, "is_connected");
   generic_raw_uart_set_connection_state(raw_uart, true);
+
+  if (endpointIdentifier == 0 && READ_ONCE(connection_started))
+  {
+    /* A new session starts with radio frame forwarding disabled and an
+       unknown radio module state: re-enable forwarding for the open
+       raw-uart connection and flag it as stale for userspace. */
+    hb_rf_eth_queue_msg(5, NULL, 0);
+    WRITE_ONCE(session_lost, true);
+    sysfs_notify(&dev->kobj, NULL, "session_lost");
+  }
+
   return 0;
 }
 
@@ -363,6 +383,7 @@ static int hb_rf_eth_recv_threadproc(void *data)
   char *buffer;
   int len;
   int i;
+  int attempts;
   unsigned long lastReceivedKeepAlive = jiffies;
 
   hb_rf_eth_set_high_prio();
@@ -403,6 +424,7 @@ static int hb_rf_eth_recv_threadproc(void *data)
 
       if (autoreconnect)
       {
+        attempts = 0;
         while (!kthread_should_stop())
         {
           dev_info(dev, "Trying to reconnect to %pI4\n", &remote.sin_addr);
@@ -410,6 +432,14 @@ static int hb_rf_eth_recv_threadproc(void *data)
           {
             lastReceivedKeepAlive = jiffies;
             dev_info(dev, "Successfully connected to %pI4\n", &remote.sin_addr);
+            break;
+          }
+          /* A restarted gateway silently rejects resuming the previous
+             session, so periodically also try to start a new one. */
+          if (++attempts % NEW_SESSION_INTERVAL == 0 && hb_rf_eth_try_connect(0) == 0)
+          {
+            lastReceivedKeepAlive = jiffies;
+            dev_warn(dev, "Previous session was rejected, started new session with %pI4\n", &remote.sin_addr);
             break;
           }
 	  msleep_interruptible(500);
@@ -640,6 +670,7 @@ static int hb_rf_eth_reset_radio_module(struct generic_raw_uart *raw_uart)
 
 static int hb_rf_eth_start_connection(struct generic_raw_uart *raw_uart)
 {
+  WRITE_ONCE(connection_started, true);
   hb_rf_eth_queue_msg(5, NULL, 0);
   msleep(20);
   return 0;
@@ -647,8 +678,16 @@ static int hb_rf_eth_start_connection(struct generic_raw_uart *raw_uart)
 
 static void hb_rf_eth_stop_connection(struct generic_raw_uart *raw_uart)
 {
+  WRITE_ONCE(connection_started, false);
   hb_rf_eth_queue_msg(6, NULL, 0);
   msleep(20);
+
+  /* the last stale connection was closed */
+  if (READ_ONCE(session_lost))
+  {
+    WRITE_ONCE(session_lost, false);
+    sysfs_notify(&dev->kobj, NULL, "session_lost");
+  }
 }
 
 static void hb_rf_eth_stop_tx(struct generic_raw_uart *raw_uart)
@@ -731,6 +770,12 @@ static ssize_t is_connected_show(struct device *dev, struct device_attribute *at
 }
 static DEVICE_ATTR_RO(is_connected);
 
+static ssize_t session_lost_show(struct device *dev, struct device_attribute *attr, char *page)
+{
+  return sprintf(page, "%d\n", READ_ONCE(session_lost) ? 1 : 0);
+}
+static DEVICE_ATTR_RO(session_lost);
+
 static const char *hb_rf_eth_gpio_names[3] = { "HB-RF-ETH HM_RED", "HB-RF-ETH HM_GREEN", "HB-RF-ETH HM_BLUE" };
 
 static int __init hb_rf_eth_init(void)
@@ -801,6 +846,10 @@ static int __init hb_rf_eth_init(void)
   if (err)
     dev_info(dev, "failed creating is_connected sysfs file: %d\n", err);
 
+  err = sysfs_create_file(&dev->kobj, &dev_attr_session_lost.attr);
+  if (err)
+    dev_info(dev, "failed creating session_lost sysfs file: %d\n", err);
+
   err = sysfs_create_file(&dev->kobj, &dev_attr_connect.attr);
     dev_info(dev, "failed creating connect sysfs file: %d\n", err);
 
@@ -822,6 +871,7 @@ static void __exit hb_rf_eth_exit(void)
     generic_raw_uart_remove(raw_uart);
 
   sysfs_remove_file(&dev->kobj, &dev_attr_is_connected.attr);
+  sysfs_remove_file(&dev->kobj, &dev_attr_session_lost.attr);
   sysfs_remove_file(&dev->kobj, &dev_attr_connect.attr);
 
   gpiochip_remove(&gc);
@@ -862,5 +912,5 @@ module_exit(hb_rf_eth_exit);
 
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 MODULE_DESCRIPTION("HB-RF-ETH raw uart driver");
-MODULE_VERSION("1.24");
+MODULE_VERSION("1.25");
 MODULE_LICENSE("GPL");
