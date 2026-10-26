@@ -305,14 +305,22 @@ static int hb_rf_eth_try_connect(char endpointIdentifier)
   sysfs_notify(&dev->kobj, NULL, "is_connected");
   generic_raw_uart_set_connection_state(raw_uart, true);
 
-  if (endpointIdentifier == 0 && READ_ONCE(connection_started))
+  if (READ_ONCE(connection_started))
   {
-    /* A new session starts with radio frame forwarding disabled and an
-       unknown radio module state: re-enable forwarding for the open
-       raw-uart connection and flag it as stale for userspace. */
+    /* Not only a new session starts with radio frame forwarding disabled,
+       some gateway firmwares (e.g. HB-RF-ETH-ng) also disable it on a
+       keep-alive timeout or when adopting a stale endpoint identifier:
+       always re-enable forwarding for the open raw-uart connection. */
     hb_rf_eth_queue_msg(5, NULL, 0);
-    WRITE_ONCE(session_lost, true);
-    sysfs_notify(&dev->kobj, NULL, "session_lost");
+
+    /* A new session (requested or returned with a different endpoint
+       identifier) means an unknown radio module state: flag the open
+       raw-uart connection as stale for userspace. */
+    if (endpointIdentifier == 0 || endpointIdentifier != currentEndpointIdentifier)
+    {
+      WRITE_ONCE(session_lost, true);
+      sysfs_notify(&dev->kobj, NULL, "session_lost");
+    }
   }
 
   return 0;
@@ -912,5 +920,5 @@ module_exit(hb_rf_eth_exit);
 
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 MODULE_DESCRIPTION("HB-RF-ETH raw uart driver");
-MODULE_VERSION("1.25");
+MODULE_VERSION("1.26");
 MODULE_LICENSE("GPL");
