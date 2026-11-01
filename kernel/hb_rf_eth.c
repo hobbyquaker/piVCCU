@@ -34,6 +34,7 @@
 #include <uapi/linux/sched/types.h>
 #endif
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/circ_buf.h>
 #include "generic_raw_uart.h"
 
@@ -53,6 +54,11 @@ static spinlock_t gpio_lock;
 static u8 gpio_value = 0;
 
 static struct socket *_sock = NULL;
+/* Serializes publishing and releasing _sock against its use by the sender
+   thread. A mutex, as kernel_sendmsg() may sleep. Only the receiver thread
+   (or the connect/disconnect code while no threads run) replaces or
+   releases _sock, so it may read _sock without taking the lock. */
+static DEFINE_MUTEX(sock_lock);
 static struct sockaddr_in remote = {0};
 static atomic_t msg_cnt = ATOMIC_INIT(0);
 static struct task_struct *k_recv_thread = NULL;
@@ -308,7 +314,9 @@ static int hb_rf_eth_try_connect(char endpointIdentifier)
     }
   }
 
+  mutex_lock(&sock_lock);
   _sock = sock;
+  mutex_unlock(&sock_lock);
   sysfs_notify(&dev->kobj, NULL, "is_connected");
   generic_raw_uart_set_connection_state(raw_uart, true);
 
@@ -355,6 +363,26 @@ static bool is_queue_filled(int *head, int *tail)
   return CIRC_CNT(*head, *tail, QUEUE_LENGTH) >= 1;
 }
 
+static void hb_rf_eth_send_locked(char *buffer, size_t len)
+{
+  mutex_lock(&sock_lock);
+  hb_rf_eth_send_msg(_sock, buffer, len);
+  mutex_unlock(&sock_lock);
+}
+
+static void hb_rf_eth_release_sock(void)
+{
+  struct socket *sock;
+
+  mutex_lock(&sock_lock);
+  sock = _sock;
+  _sock = NULL;
+  mutex_unlock(&sock_lock);
+
+  if (sock)
+    sock_release(sock);
+}
+
 static int hb_rf_eth_send_threadproc(void *data)
 {
   struct send_msg_queue_entry *entry;
@@ -377,7 +405,7 @@ static int hb_rf_eth_send_threadproc(void *data)
         entry->buffer[2] = gpio_value;
       }
 
-      hb_rf_eth_send_msg(_sock, entry->buffer, entry->len);
+      hb_rf_eth_send_locked(entry->buffer, entry->len);
 
       tail = (tail + 1) & (QUEUE_LENGTH - 1);
       smp_store_release(&send_msg_queue->tail, tail);
@@ -386,7 +414,7 @@ static int hb_rf_eth_send_threadproc(void *data)
     if (time_after(jiffies, nextKeepAliveSentOut))
     {
       nextKeepAliveSentOut = jiffies + msecs_to_jiffies(1000);
-      hb_rf_eth_send_msg(_sock, buffer, 4);
+      hb_rf_eth_send_locked(buffer, 4);
     }
   }
 
@@ -432,8 +460,7 @@ static int hb_rf_eth_recv_threadproc(void *data)
     if (time_after(jiffies, lastReceivedKeepAlive + msecs_to_jiffies(5000)))
     {
       dev_err(dev, "Did not receive any packet in the last 5 seconds, terminating connection.\n");
-      sock_release(_sock);
-      _sock = NULL;
+      hb_rf_eth_release_sock();
       sysfs_notify(&dev->kobj, NULL, "is_connected");
       generic_raw_uart_set_connection_state(raw_uart, false);
 
@@ -510,8 +537,7 @@ static int hb_rf_eth_connect(const char *ip)
     err = PTR_ERR(k_recv_thread);
     dev_err(dev, "Error creating receiver thread\n");
     k_recv_thread = NULL;
-    sock_release(_sock);
-    _sock = NULL;
+    hb_rf_eth_release_sock();
     sysfs_notify(&dev->kobj, NULL, "is_connected");
     generic_raw_uart_set_connection_state(raw_uart, false);
     return err;
@@ -526,8 +552,7 @@ static int hb_rf_eth_connect(const char *ip)
       k_send_thread = NULL;
       kthread_stop(k_recv_thread);
       k_recv_thread = NULL;
-      sock_release(_sock);
-      _sock = NULL;
+      hb_rf_eth_release_sock();
       sysfs_notify(&dev->kobj, NULL, "is_connected");
       generic_raw_uart_set_connection_state(raw_uart, false);
       return err;
@@ -558,9 +583,8 @@ static void hb_rf_eth_disconnect(void)
 
   if (_sock)
   {
-    hb_rf_eth_send_msg(_sock, buffer, sizeof(buffer));
-    sock_release(_sock);
-    _sock = NULL;
+    hb_rf_eth_send_locked(buffer, sizeof(buffer));
+    hb_rf_eth_release_sock();
     sysfs_notify(&dev->kobj, NULL, "is_connected");
     generic_raw_uart_set_connection_state(raw_uart, false);
   }
