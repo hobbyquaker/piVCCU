@@ -951,5 +951,5 @@ module_exit(hb_rf_eth_exit);
 
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 MODULE_DESCRIPTION("HB-RF-ETH raw uart driver");
-MODULE_VERSION("1.26");
+MODULE_VERSION("1.27");
 MODULE_LICENSE("GPL");
