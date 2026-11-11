@@ -890,6 +890,7 @@ static int __init hb_rf_eth_init(void)
     dev_info(dev, "failed creating session_lost sysfs file: %d\n", err);
 
   err = sysfs_create_file(&dev->kobj, &dev_attr_connect.attr);
+  if (err)
     dev_info(dev, "failed creating connect sysfs file: %d\n", err);
 
   return 0;
@@ -951,5 +952,5 @@ module_exit(hb_rf_eth_exit);
 
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 MODULE_DESCRIPTION("HB-RF-ETH raw uart driver");
-MODULE_VERSION("1.28");
+MODULE_VERSION("1.29");
 MODULE_LICENSE("GPL");
