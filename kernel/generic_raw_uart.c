@@ -77,6 +77,7 @@ struct generic_raw_uart_instance
 {
   spinlock_t lock_tx;                        /*TX lock for accessing tx_connection*/
   struct semaphore sem;                      /*semaphore for accessing this struct*/
+  struct semaphore open_sem;                 /*serializes open and close, i.e. start_connection and stop_connection*/
   wait_queue_head_t readq;                   /*wait queue for read operations*/
   wait_queue_head_t writeq;                  /*wait queue for write operations*/
   struct circ_buf rxbuf;                     /*RX buffer*/
@@ -385,31 +386,32 @@ static int generic_raw_uart_open(struct inode *inode, struct file *filep)
     return -ENODEV;
   }
 
+  if (down_interruptible(&instance->open_sem))
+  {
+    ret = -ERESTARTSYS;
+    goto failed_open_sem;
+  }
+
   /*Get semaphore*/
   if (down_interruptible(&instance->sem))
   {
-    return -ERESTARTSYS;
+    ret = -ERESTARTSYS;
+    goto failed_sem;
   }
 
   /* check for the maximum number of connections */
   if (instance->open_count >= MAX_CONNECTIONS)
   {
     dev_err(instance->dev, "generic_raw_uart_open(): Too many open connections.");
-
-    /*Release semaphore*/
-    up(&instance->sem);
-
-    return -EMFILE;
+    ret = -EMFILE;
+    goto failed;
   }
 
   if (!instance->connection_state)
   {
     dev_err(instance->dev, "generic_raw_uart_open(): Tried to open disconnected device.");
-
-    /*Release semaphore*/
-    up(&instance->sem);
-
-    return -ENODEV;
+    ret = -ENODEV;
+    goto failed;
   }
 
   if (!instance->open_count) /*Enable HW for the first connection.*/
@@ -417,9 +419,7 @@ static int generic_raw_uart_open(struct inode *inode, struct file *filep)
     ret = instance->driver->start_connection(&instance->raw_uart);
     if (ret)
     {
-      /*Release semaphore*/
-      up(&instance->sem);
-      return ret;
+      goto failed;
     }
 
     instance->rxbuf.head = instance->rxbuf.tail = 0;
@@ -430,8 +430,9 @@ static int generic_raw_uart_open(struct inode *inode, struct file *filep)
 
   instance->open_count++;
 
-  /*Release semaphore*/
+  /*Release semaphores*/
   up(&instance->sem);
+  up(&instance->open_sem);
 
   conn = kmalloc(sizeof(struct per_connection_data), GFP_KERNEL);
   memset(conn, 0, sizeof(struct per_connection_data));
@@ -441,6 +442,14 @@ static int generic_raw_uart_open(struct inode *inode, struct file *filep)
   filep->private_data = (void *)conn;
 
   return 0;
+
+failed:
+  up(&instance->sem);
+failed_sem:
+  up(&instance->open_sem);
+failed_open_sem:
+  module_put(instance->driver->owner);
+  return ret;
 }
 
 static int generic_raw_uart_close(struct inode *inode, struct file *filep)
@@ -448,35 +457,44 @@ static int generic_raw_uart_close(struct inode *inode, struct file *filep)
   struct per_connection_data *conn = filep->private_data;
   struct generic_raw_uart_instance *instance = container_of(inode->i_cdev, struct generic_raw_uart_instance, cdev);
   struct module *owner = instance->driver->owner;
+  bool last;
 
-  if (down_interruptible(&conn->sem))
-  {
-    return -ERESTARTSYS;
-  }
+  /*
+   * A release must not fail: an interrupted wait here would leak the connection and open_count, and an
+   * exiting process (the common case) may well have a signal pending.
+   */
+  down(&conn->sem);
 
   kfree(conn);
 
-  if (down_interruptible(&instance->sem))
-  {
-    return -ERESTARTSYS;
-  }
+  down(&instance->open_sem);
+
+  down(&instance->sem);
 
   if (instance->open_count)
   {
     instance->open_count--;
   }
 
-  if (!instance->open_count)
+  last = !instance->open_count;
+
+  up(&instance->sem);
+
+  if (last)
   {
     /*
      * When the underlying device is already gone (a USB stick pulled while open), this is where the
      * hb_rf_usb drivers drop their last reference and end up in generic_raw_uart_remove(). The instance
      * stays valid nevertheless: this file's cdev reference holds the device until the fput() behind us.
+     *
+     * Not under instance->sem: the remove deletes the sysfs attributes and waits for their running
+     * callbacks, and reset_radio_module_store() takes instance->sem - holding it here would deadlock.
+     * open_sem keeps a concurrent open from starting the connection while it is being stopped.
      */
     instance->driver->stop_connection(&instance->raw_uart);
   }
 
-  up(&instance->sem);
+  up(&instance->open_sem);
 
   module_put(owner);
 
@@ -1292,6 +1310,13 @@ struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_u
     goto failed_inst_alloc;
   }
 
+  /*before the device node and the sysfs attributes appear, whose callbacks take them*/
+  sema_init(&instance->sem, 1);
+  sema_init(&instance->open_sem, 1);
+  spin_lock_init(&instance->lock_tx);
+  init_waitqueue_head(&instance->readq);
+  init_waitqueue_head(&instance->writeq);
+
   instance->raw_uart.private = instance;
   instance->raw_uart.driver_data = driver_data;
   instance->raw_uart.dev_number = dev_no;
@@ -1365,11 +1390,6 @@ struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_u
 
   err = sysfs_create_file(&instance->dev->kobj, &dev_attr_open_count.attr);
   err = sysfs_create_file(&instance->dev->kobj, &dev_attr_connection_state.attr);
-
-  sema_init(&instance->sem, 1);
-  spin_lock_init(&instance->lock_tx);
-  init_waitqueue_head(&instance->readq);
-  init_waitqueue_head(&instance->writeq);
 
   instance->rxbuf.buf = kmalloc(CIRCBUF_SIZE, GFP_KERNEL);
 
@@ -1590,7 +1610,7 @@ EXPORT_SYMBOL(generic_raw_uart_verify_dkey);
 
 MODULE_ALIAS("platform:generic-raw-uart");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.34");
+MODULE_VERSION("1.35");
 MODULE_DESCRIPTION("generic raw uart driver for communication of debmatic and piVCCU with the HM-MOD-RPI-PCB and RPI-RF-MOD radio modules");
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 
