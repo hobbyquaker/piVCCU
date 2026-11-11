@@ -82,6 +82,7 @@ struct generic_raw_uart_instance
   struct circ_buf rxbuf;                     /*RX buffer*/
   int open_count;                            /*number of open connections*/
   bool connection_state;
+  bool hung_up;                              /*the underlying device is gone for good*/
   struct per_connection_data *tx_connection; /*connection which is currently sending*/
   struct termios termios;                    /*dummy termios for emulating ttyp ioctls*/
 
@@ -201,13 +202,19 @@ static ssize_t generic_raw_uart_read(struct file *filep, char __user *buf, size_
   while (!CIRC_CNT(instance->rxbuf.head, instance->rxbuf.tail, CIRCBUF_SIZE)) /* Wait for data, if there's currently nothing to read */
   {
     up(&instance->sem);
+    if (READ_ONCE(instance->hung_up))
+    {
+      ret = -ENODEV;
+      goto exit;
+    }
+
     if (filep->f_flags & O_NONBLOCK)
     {
       ret = -EAGAIN;
       goto exit;
     }
 
-    if (wait_event_interruptible(instance->readq, CIRC_CNT(instance->rxbuf.head, instance->rxbuf.tail, CIRCBUF_SIZE)))
+    if (wait_event_interruptible(instance->readq, CIRC_CNT(instance->rxbuf.head, instance->rxbuf.tail, CIRCBUF_SIZE) || READ_ONCE(instance->hung_up)))
     {
       ret = -ERESTARTSYS;
       goto exit;
@@ -246,12 +253,19 @@ static ssize_t generic_raw_uart_write(struct file *filep, const char __user *buf
 {
   struct generic_raw_uart_instance *instance = container_of(filep->f_inode->i_cdev, struct generic_raw_uart_instance, cdev);
   struct per_connection_data *conn = filep->private_data;
+  unsigned long lock_flags;
   int ret = 0;
 
   if (down_interruptible(&conn->sem))
   {
     ret = -ERESTARTSYS;
     goto exit;
+  }
+
+  if (READ_ONCE(instance->hung_up))
+  {
+    ret = -ENODEV;
+    goto exit_sem;
   }
 
   if (count > sizeof(conn->txbuf))
@@ -272,16 +286,28 @@ static ssize_t generic_raw_uart_write(struct file *filep, const char __user *buf
   conn->tx_buf_length = count;
   smp_wmb(); /*Wait until completion of all writes*/
 
-  if (wait_event_interruptible(instance->writeq, generic_raw_uart_acquire_sender(instance, conn)))
+  if (wait_event_interruptible(instance->writeq, READ_ONCE(instance->hung_up) || generic_raw_uart_acquire_sender(instance, conn)))
   {
     ret = -ERESTARTSYS;
     goto exit_sem;
   }
 
   /*wait for sending to complete*/
-  if (wait_event_interruptible(instance->writeq, generic_raw_uart_send_completed(instance, conn)))
+  if (wait_event_interruptible(instance->writeq, READ_ONCE(instance->hung_up) || generic_raw_uart_send_completed(instance, conn)))
   {
     ret = -ERESTARTSYS;
+    goto exit_sem;
+  }
+
+  if (READ_ONCE(instance->hung_up))
+  {
+    /*a sender acquired right before the hangup must not stay behind with this connection*/
+    spin_lock_irqsave(&instance->lock_tx, lock_flags);
+    if (instance->tx_connection == conn)
+      instance->tx_connection = NULL;
+    spin_unlock_irqrestore(&instance->lock_tx, lock_flags);
+
+    ret = -ENODEV;
     goto exit_sem;
   }
 
@@ -477,6 +503,11 @@ static unsigned int generic_raw_uart_poll(struct file *filep, poll_table *wait)
   if (CIRC_CNT(instance->rxbuf.head, instance->rxbuf.tail, CIRCBUF_SIZE) > 0)
   {
     mask |= POLLIN | POLLRDNORM;
+  }
+
+  if (READ_ONCE(instance->hung_up))
+  {
+    mask |= POLLHUP | POLLERR;
   }
 
   return mask;
@@ -1378,12 +1409,36 @@ int generic_raw_uart_set_connection_state(struct generic_raw_uart *raw_uart, boo
 }
 EXPORT_SYMBOL(generic_raw_uart_set_connection_state);
 
+/*
+ * The underlying device is gone for good (a USB stick pulled, a driver unbound): readers and writers
+ * that wait for it are woken and fail with -ENODEV, poll() reports POLLHUP, so whoever holds the
+ * raw-uart open notices and closes it - which is what lets the instance go away.
+ */
+void generic_raw_uart_hangup(struct generic_raw_uart *raw_uart)
+{
+  struct generic_raw_uart_instance *instance = raw_uart->private;
+  unsigned long lock_flags;
+
+  generic_raw_uart_set_connection_state(raw_uart, false);
+
+  WRITE_ONCE(instance->hung_up, true);
+
+  /*nothing will be sent anymore: release a writer that waits for its frame to complete*/
+  spin_lock_irqsave(&instance->lock_tx, lock_flags);
+  instance->tx_connection = NULL;
+  spin_unlock_irqrestore(&instance->lock_tx, lock_flags);
+
+  wake_up_interruptible(&instance->readq);
+  wake_up_interruptible(&instance->writeq);
+}
+EXPORT_SYMBOL(generic_raw_uart_hangup);
+
 int generic_raw_uart_remove(struct generic_raw_uart *raw_uart)
 {
   struct generic_raw_uart_instance *instance = raw_uart->private;
   unsigned long flags;
 
-  generic_raw_uart_set_connection_state(raw_uart, false);
+  generic_raw_uart_hangup(raw_uart);
 
 #ifdef PROC_DEBUG
   remove_proc_entry(dev_name(instance->dev), NULL);
@@ -1535,7 +1590,7 @@ EXPORT_SYMBOL(generic_raw_uart_verify_dkey);
 
 MODULE_ALIAS("platform:generic-raw-uart");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.33");
+MODULE_VERSION("1.34");
 MODULE_DESCRIPTION("generic raw uart driver for communication of debmatic and piVCCU with the HM-MOD-RPI-PCB and RPI-RF-MOD radio modules");
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 

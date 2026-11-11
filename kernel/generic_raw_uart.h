@@ -87,6 +87,7 @@ struct hb_usb_device_info
 extern struct generic_raw_uart *generic_raw_uart_probe(struct device *dev, struct raw_uart_driver *driver, void *driver_data);
 extern int generic_raw_uart_set_connection_state(struct generic_raw_uart *raw_uart, bool state);
 extern int generic_raw_uart_remove(struct generic_raw_uart *raw_uart);
+extern void generic_raw_uart_hangup(struct generic_raw_uart *raw_uart);
 extern void generic_raw_uart_tx_queued(struct generic_raw_uart *raw_uart);
 extern void generic_raw_uart_handle_rx_char(struct generic_raw_uart *raw_uart, enum generic_raw_uart_rx_flags, unsigned char);
 extern void generic_raw_uart_rx_completed(struct generic_raw_uart *raw_uart);

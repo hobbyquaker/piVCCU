@@ -604,7 +604,7 @@ static void hb_rf_usb_disconnect(struct usb_interface *interface)
 
   gpiochip_remove(&port->gc);
 
-  generic_raw_uart_set_connection_state(port->raw_uart, false);
+  generic_raw_uart_hangup(port->raw_uart);
 
   kref_put(&port->kref, hb_rf_usb_delete);
 }
@@ -657,6 +657,6 @@ module_init(hb_rf_usb_init);
 module_exit(hb_rf_usb_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.17");
+MODULE_VERSION("1.18");
 MODULE_DESCRIPTION("HB-RF-USB raw uart driver for communication of debmatic and piVCCU with the HM-MOD-RPI-PCB and RPI-RF-MOD radio modules");
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
