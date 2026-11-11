@@ -875,7 +875,7 @@ static int __init hb_rf_eth_init(void)
   raw_uart = generic_raw_uart_probe(dev, &hb_rf_eth, NULL);
   if (IS_ERR(raw_uart))
   {
-    err = PTR_ERR(dev);
+    err = PTR_ERR(raw_uart);
     goto failed_raw_uart_probe;
   }
 
@@ -951,5 +951,5 @@ module_exit(hb_rf_eth_exit);
 
 MODULE_AUTHOR("Alexander Reinert <alex@areinert.de>");
 MODULE_DESCRIPTION("HB-RF-ETH raw uart driver");
-MODULE_VERSION("1.27");
+MODULE_VERSION("1.28");
 MODULE_LICENSE("GPL");
